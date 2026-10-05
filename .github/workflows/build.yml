@@ -1,0 +1,265 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Write project files
+        run: |
+          mkdir -p $(dirname settings.gradle.kts)
+          cat > settings.gradle.kts <<'APPGUARD_EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "AppGuard"
+          include(":app")
+          APPGUARD_EOF
+          mkdir -p $(dirname build.gradle.kts)
+          cat > build.gradle.kts <<'APPGUARD_EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          APPGUARD_EOF
+          mkdir -p $(dirname gradle.properties)
+          cat > gradle.properties <<'APPGUARD_EOF'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=true
+          APPGUARD_EOF
+          mkdir -p $(dirname app/build.gradle.kts)
+          cat > app/build.gradle.kts <<'APPGUARD_EOF'
+          plugins { id("com.android.application"); id("org.jetbrains.kotlin.android") }
+          android {
+              namespace = "com.example.appguard"
+              compileSdk = 34
+              defaultConfig { applicationId = "com.example.appguard"; minSdk = 29; targetSdk = 34; versionCode = 1; versionName = "0.1" }
+              compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          APPGUARD_EOF
+          mkdir -p $(dirname app/src/main/AndroidManifest.xml)
+          cat > app/src/main/AndroidManifest.xml <<'APPGUARD_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"/>
+              <application android:label="نگهبان اپ‌ها" android:supportsRtl="true"
+                  android:theme="@android:style/Theme.Material.Light.DarkActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          APPGUARD_EOF
+          mkdir -p $(dirname app/src/main/java/com/example/appguard/Scanner.kt)
+          cat > app/src/main/java/com/example/appguard/Scanner.kt <<'APPGUARD_EOF'
+          package com.example.appguard
+
+          import android.app.AppOpsManager
+          import android.app.admin.DevicePolicyManager
+          import android.content.Context
+          import android.content.pm.ApplicationInfo
+          import android.content.pm.PackageManager
+          import android.provider.Settings
+
+          enum class Fix { APP_SETTINGS, ACCESSIBILITY, NOTIF_LISTENER, DEVICE_ADMIN, OVERLAY }
+
+          /** severity: 3 = خطرناک، 2 = قابل‌توجه، 1 = کم‌خطر */
+          data class Finding(val pkg: String, val app: String, val severity: Int,
+                             val title: String, val why: String, val fix: Fix)
+
+          object Scanner {
+              private class P(val perm: String, val sev: Int, val title: String, val why: String)
+
+              private val perms = listOf(
+                  P("android.permission.ACCESS_BACKGROUND_LOCATION", 3, "مکان‌یابی در پس‌زمینه",
+                      "این اپ می‌تواند حتی وقتی بازش نکرده‌اید موقعیت شما را بگیرد و مسیرهای رفت‌وآمدتان را ثبت کند."),
+                  P("android.permission.RECORD_AUDIO", 3, "دسترسی به میکروفون",
+                      "امکان ضبط صدا دارد. مگر اینکه اپ پیام‌رسان یا ضبط صدا باشد، معمولاً لازم نیست."),
+                  P("android.permission.READ_SMS", 3, "خواندن پیامک‌ها",
+                      "می‌تواند همه‌ی پیامک‌ها از جمله کدهای تأیید بانکی را بخواند."),
+                  P("android.permission.RECEIVE_SMS", 2, "دریافت پیامک",
+                      "می‌تواند پیامک‌های ورودی (مثل رمز یک‌بارمصرف) را ببیند."),
+                  P("android.permission.READ_CALL_LOG", 3, "خواندن تاریخچه‌ی تماس‌ها",
+                      "به لیست تماس‌های ورودی و خروجی شما دسترسی دارد."),
+                  P("android.permission.READ_CONTACTS", 2, "خواندن مخاطبین",
+                      "کل دفترچه‌تلفن شما قابل خواندن و ارسال به سرور است."),
+                  P("android.permission.CAMERA", 2, "دسترسی به دوربین",
+                      "می‌تواند از دوربین استفاده کند. بررسی کنید که واقعاً به آن نیاز دارد."),
+                  P("android.permission.ACCESS_FINE_LOCATION", 2, "مکان دقیق",
+                      "موقعیت دقیق GPS شما را می‌تواند بخواند."),
+                  P("android.permission.READ_PHONE_STATE", 1, "اطلاعات تلفن و شبکه",
+                      "می‌تواند وضعیت تلفن و شناسه‌های دستگاه را بخواند که برای ردیابی استفاده می‌شود."),
+                  P("android.permission.GET_ACCOUNTS", 1, "فهرست حساب‌های کاربری",
+                      "می‌تواند ببیند چه حساب‌هایی روی گوشی دارید.")
+              )
+
+              fun scan(ctx: Context): List<Finding> {
+                  val pm = ctx.packageManager
+                  val out = mutableListOf<Finding>()
+                  val acc = Settings.Secure.getString(ctx.contentResolver, "enabled_accessibility_services") ?: ""
+                  val nl = Settings.Secure.getString(ctx.contentResolver, "enabled_notification_listeners") ?: ""
+                  val admins = try {
+                      (ctx.getSystemService(Context.DEVICE_POLICY_SERVICE) as DevicePolicyManager)
+                          .activeAdmins?.map { it.packageName }?.toSet() ?: emptySet()
+                  } catch (e: Exception) { emptySet() }
+                  val ops = ctx.getSystemService(Context.APP_OPS_SERVICE) as AppOpsManager
+
+                  val pkgs = pm.getInstalledPackages(PackageManager.GET_PERMISSIONS)
+                  for (pi in pkgs) {
+                      val ai = pi.applicationInfo ?: continue
+                      if (ai.flags and ApplicationInfo.FLAG_SYSTEM != 0) continue
+                      if (pi.packageName == ctx.packageName) continue
+                      val pkg = pi.packageName
+                      val name = pm.getApplicationLabel(ai).toString()
+
+                      fun add(sev: Int, t: String, w: String, f: Fix) = out.add(Finding(pkg, name, sev, t, w, f))
+
+                      val req = pi.requestedPermissions ?: emptyArray()
+                      val flags = pi.requestedPermissionsFlags ?: IntArray(0)
+                      val granted = req.indices.filter {
+                          flags.getOrElse(it) { 0 } and android.content.pm.PackageInfo.REQUESTED_PERMISSION_GRANTED != 0
+                      }.map { req[it] }.toSet()
+
+                      for (p in perms) if (p.perm in granted) add(p.sev, p.title, p.why, Fix.APP_SETTINGS)
+
+                      if (acc.split(':').any { it.startsWith("$pkg/") })
+                          add(3, "سرویس دسترس‌پذیری (Accessibility) فعال",
+                              "خطرناک‌ترین دسترسی: این اپ می‌تواند هر چه روی صفحه نمایش داده می‌شود یا تایپ می‌کنید ببیند و حتی به‌جای شما کلیک کند. بدافزارها زیاد از آن استفاده می‌کنند.",
+                              Fix.ACCESSIBILITY)
+                      if (nl.split(':').any { it.startsWith("$pkg/") })
+                          add(3, "دسترسی به همه‌ی اعلان‌ها",
+                              "می‌تواند محتوای تمام نوتیفیکیشن‌های شما از جمله پیام‌ها و کدهای تأیید را بخواند.",
+                              Fix.NOTIF_LISTENER)
+                      if (pkg in admins)
+                          add(3, "مدیر دستگاه (Device Admin) فعال",
+                              "می‌تواند قفل صفحه را کنترل کند، گوشی را پاک کند و حذف خودش را سخت کند.",
+                              Fix.DEVICE_ADMIN)
+                      if ("android.permission.SYSTEM_ALERT_WINDOW" in req &&
+                          ops.unsafeCheckOpNoThrow("android:system_alert_window", ai.uid, pkg) == AppOpsManager.MODE_ALLOWED)
+                          add(2, "نمایش روی سایر اپ‌ها",
+                              "می‌تواند روی اپ‌های دیگر (مثلاً بانک) صفحه‌ی جعلی نشان دهد.",
+                              Fix.OVERLAY)
+                  }
+                  return out.sortedWith(compareByDescending<Finding> { it.severity }.thenBy { it.app })
+              }
+          }
+          APPGUARD_EOF
+          mkdir -p $(dirname app/src/main/java/com/example/appguard/MainActivity.kt)
+          cat > app/src/main/java/com/example/appguard/MainActivity.kt <<'APPGUARD_EOF'
+          package com.example.appguard
+
+          import android.app.Activity
+          import android.app.AlertDialog
+          import android.content.Intent
+          import android.graphics.Color
+          import android.net.Uri
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.view.Gravity
+          import android.view.View
+          import android.widget.*
+
+          class MainActivity : Activity() {
+              private lateinit var list: LinearLayout
+              private lateinit var status: TextView
+              private val prefs by lazy { getSharedPreferences("ignored", MODE_PRIVATE) }
+
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL; setPadding(32, 32, 32, 32)
+                      layoutDirection = View.LAYOUT_DIRECTION_RTL
+                  }
+                  val btn = Button(this).apply { text = "اسکن دوباره"; setOnClickListener { scan() } }
+                  status = TextView(this).apply { textSize = 15f; setPadding(0, 16, 0, 16) }
+                  list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                  root.addView(btn); root.addView(status)
+                  root.addView(ScrollView(this).apply { addView(list) })
+                  setContentView(root)
+              }
+
+              override fun onResume() { super.onResume(); scan() }
+
+              private fun scan() {
+                  status.text = "در حال بررسی اپ‌ها..."
+                  Thread {
+                      val all = Scanner.scan(this)
+                      val ignored = prefs.getStringSet("set", emptySet()) ?: emptySet()
+                      val shown = all.filter { "${it.pkg}|${it.title}" !in ignored }
+                      runOnUiThread { render(shown) }
+                  }.start()
+              }
+
+              private fun render(items: List<Finding>) {
+                  list.removeAllViews()
+                  status.text = if (items.isEmpty()) "مورد مشکوکی پیدا نشد." else "${items.size} مورد پیدا شد. برای جزئیات روی هر مورد بزنید."
+                  for (f in items) {
+                      val color = when (f.severity) { 3 -> "#C62828"; 2 -> "#EF6C00"; else -> "#F9A825" }
+                      val card = TextView(this).apply {
+                          text = "${f.app}\n${f.title}"; textSize = 16f; setPadding(32, 24, 32, 24)
+                          setTextColor(Color.BLACK); setBackgroundColor(Color.parseColor("#F2F2F2"))
+                          gravity = Gravity.START
+                          setOnClickListener { ask(f) }
+                      }
+                      val row = LinearLayout(this).apply {
+                          layoutDirection = View.LAYOUT_DIRECTION_RTL
+                          addView(View(context).apply { setBackgroundColor(Color.parseColor(color)) },
+                              LinearLayout.LayoutParams(16, LinearLayout.LayoutParams.MATCH_PARENT))
+                          addView(card, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+                      }
+                      list.addView(row, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = 16 })
+                  }
+              }
+
+              private fun ask(f: Finding) {
+                  val level = when (f.severity) { 3 -> "ریسک بالا"; 2 -> "ریسک متوسط"; else -> "ریسک کم" }
+                  AlertDialog.Builder(this).setTitle("${f.app} — ${f.title}")
+                      .setMessage("$level\n\n${f.why}\n\nمی‌خواهید این دسترسی را محدود کنید؟")
+                      .setPositiveButton("محدود کن") { _, _ -> openFix(f) }
+                      .setNeutralButton("نادیده بگیر") { _, _ ->
+                          val s = (prefs.getStringSet("set", emptySet()) ?: emptySet()).toMutableSet()
+                          s.add("${f.pkg}|${f.title}"); prefs.edit().putStringSet("set", s).apply(); scan()
+                      }
+                      .setNegativeButton("بعداً", null).show()
+              }
+
+              private fun openFix(f: Finding) {
+                  val uri = Uri.parse("package:${f.pkg}")
+                  val i = when (f.fix) {
+                      Fix.APP_SETTINGS -> Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, uri)
+                      Fix.ACCESSIBILITY -> Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
+                      Fix.NOTIF_LISTENER -> Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)
+                      Fix.DEVICE_ADMIN -> Intent(Settings.ACTION_SECURITY_SETTINGS)
+                      Fix.OVERLAY -> Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, uri)
+                  }
+                  try { startActivity(i) } catch (e: Exception) {
+                      Toast.makeText(this, "تنظیمات باز نشد", Toast.LENGTH_SHORT).show()
+                  }
+              }
+          }
+          APPGUARD_EOF
+      - name: Build
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AppGuard-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp app/build/outputs/apk/debug/app-debug.apk AppGuard.apk
+          gh release create v${{ github.run_number }} AppGuard.apk --repo ${{ github.repository }} --title "AppGuard v${{ github.run_number }}" --notes "APK"
