@@ -1,0 +1,557 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Write project files
+        run: |
+          mkdir -p $(dirname settings.gradle.kts)
+          cat > settings.gradle.kts <<'APPGUARD_EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "AppGuard"
+          include(":app")
+          APPGUARD_EOF
+          mkdir -p $(dirname build.gradle.kts)
+          cat > build.gradle.kts <<'APPGUARD_EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          APPGUARD_EOF
+          mkdir -p $(dirname gradle.properties)
+          cat > gradle.properties <<'APPGUARD_EOF'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=true
+          APPGUARD_EOF
+          mkdir -p $(dirname app/build.gradle.kts)
+          cat > app/build.gradle.kts <<'APPGUARD_EOF'
+          plugins { id("com.android.application"); id("org.jetbrains.kotlin.android") }
+          android {
+              namespace = "com.example.appguard"
+              compileSdk = 34
+              defaultConfig { applicationId = "com.example.appguard"; minSdk = 29; targetSdk = 34; versionCode = 1; versionName = "0.1" }
+              compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          APPGUARD_EOF
+          mkdir -p $(dirname app/src/main/AndroidManifest.xml)
+          cat > app/src/main/AndroidManifest.xml <<'APPGUARD_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"/>
+              <uses-permission android:name="android.permission.PACKAGE_USAGE_STATS"/>
+              <application android:label="نگهبان اپ‌ها" android:supportsRtl="true"
+                  android:theme="@android:style/Theme.Material.Light.DarkActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+                  <activity android:name=".NetActivity" android:exported="false"/>
+                  <service android:name=".DnsVpnService" android:exported="false"
+                      android:permission="android.permission.BIND_VPN_SERVICE">
+                      <intent-filter><action android:name="android.net.VpnService"/></intent-filter>
+                  </service>
+              </application>
+          </manifest>
+          APPGUARD_EOF
+          mkdir -p $(dirname app/src/main/java/com/example/appguard/Scanner.kt)
+          cat > app/src/main/java/com/example/appguard/Scanner.kt <<'APPGUARD_EOF'
+          package com.example.appguard
+
+          import android.app.AppOpsManager
+          import android.app.admin.DevicePolicyManager
+          import android.content.Context
+          import android.content.pm.ApplicationInfo
+          import android.content.pm.PackageManager
+          import android.app.usage.NetworkStats
+          import android.app.usage.NetworkStatsManager
+          import android.net.ConnectivityManager
+          import android.os.Process
+          import android.provider.Settings
+
+          enum class Fix { APP_SETTINGS, ACCESSIBILITY, NOTIF_LISTENER, DEVICE_ADMIN, OVERLAY }
+
+          /** severity: 3 = خطرناک، 2 = قابل‌توجه، 1 = کم‌خطر */
+          data class Finding(val pkg: String, val app: String, val severity: Int,
+                             val title: String, val why: String, val fix: Fix, val domestic: Boolean = false)
+
+          object Usage {
+              fun hasAccess(ctx: Context): Boolean {
+                  val ops = ctx.getSystemService(Context.APP_OPS_SERVICE) as AppOpsManager
+                  return ops.unsafeCheckOpNoThrow(AppOpsManager.OPSTR_GET_USAGE_STATS, Process.myUid(), ctx.packageName) == AppOpsManager.MODE_ALLOWED
+              }
+              /** مصرف اینترنت پس‌زمینه‌ی ۳ روز اخیر به تفکیک uid */
+              fun background(ctx: Context): Map<Int, Long> {
+                  if (!hasAccess(ctx)) return emptyMap()
+                  val nsm = ctx.getSystemService(Context.NETWORK_STATS_SERVICE) as NetworkStatsManager
+                  val end = System.currentTimeMillis(); val start = end - 3 * 86400000L
+                  val m = HashMap<Int, Long>()
+                  for (t in listOf(ConnectivityManager.TYPE_WIFI, ConnectivityManager.TYPE_MOBILE)) {
+                      try {
+                          val st = nsm.querySummary(t, null, start, end); val b = NetworkStats.Bucket()
+                          while (st.hasNextBucket()) {
+                              st.getNextBucket(b)
+                              if (b.state == NetworkStats.Bucket.STATE_DEFAULT) m[b.uid] = (m[b.uid] ?: 0L) + b.rxBytes + b.txBytes
+                          }
+                          st.close()
+                      } catch (e: Exception) {}
+                  }
+                  return m
+              }
+          }
+
+          object Scanner {
+              private val dom = listOf("ir.", "cab.snapp", "com.farsitel", "com.digikala", "com.sibche", "org.rajman")
+              fun isDomestic(p: String) = dom.any { p.startsWith(it) } || p.contains(".ir.") || p.endsWith(".ir")
+
+              private class P(val perm: String, val sev: Int, val title: String, val why: String)
+
+              private val perms = listOf(
+                  P("android.permission.ACCESS_BACKGROUND_LOCATION", 3, "مکان‌یابی در پس‌زمینه",
+                      "این اپ می‌تواند حتی وقتی بازش نکرده‌اید موقعیت شما را بگیرد و مسیرهای رفت‌وآمدتان را ثبت کند."),
+                  P("android.permission.RECORD_AUDIO", 3, "دسترسی به میکروفون",
+                      "امکان ضبط صدا دارد. مگر اینکه اپ پیام‌رسان یا ضبط صدا باشد، معمولاً لازم نیست."),
+                  P("android.permission.READ_SMS", 3, "خواندن پیامک‌ها",
+                      "می‌تواند همه‌ی پیامک‌ها از جمله کدهای تأیید بانکی را بخواند."),
+                  P("android.permission.RECEIVE_SMS", 2, "دریافت پیامک",
+                      "می‌تواند پیامک‌های ورودی (مثل رمز یک‌بارمصرف) را ببیند."),
+                  P("android.permission.READ_CALL_LOG", 3, "خواندن تاریخچه‌ی تماس‌ها",
+                      "به لیست تماس‌های ورودی و خروجی شما دسترسی دارد."),
+                  P("android.permission.READ_CONTACTS", 2, "خواندن مخاطبین",
+                      "کل دفترچه‌تلفن شما قابل خواندن و ارسال به سرور است."),
+                  P("android.permission.CAMERA", 2, "دسترسی به دوربین",
+                      "می‌تواند از دوربین استفاده کند. بررسی کنید که واقعاً به آن نیاز دارد."),
+                  P("android.permission.ACCESS_FINE_LOCATION", 2, "مکان دقیق",
+                      "موقعیت دقیق GPS شما را می‌تواند بخواند."),
+                  P("android.permission.READ_PHONE_STATE", 1, "اطلاعات تلفن و شبکه",
+                      "می‌تواند وضعیت تلفن و شناسه‌های دستگاه را بخواند که برای ردیابی استفاده می‌شود."),
+                  P("android.permission.GET_ACCOUNTS", 1, "فهرست حساب‌های کاربری",
+                      "می‌تواند ببیند چه حساب‌هایی روی گوشی دارید.")
+              )
+
+              fun scan(ctx: Context): List<Finding> {
+                  val pm = ctx.packageManager
+                  val out = mutableListOf<Finding>()
+                  val acc = Settings.Secure.getString(ctx.contentResolver, "enabled_accessibility_services") ?: ""
+                  val nl = Settings.Secure.getString(ctx.contentResolver, "enabled_notification_listeners") ?: ""
+                  val admins = try {
+                      (ctx.getSystemService(Context.DEVICE_POLICY_SERVICE) as DevicePolicyManager)
+                          .activeAdmins?.map { it.packageName }?.toSet() ?: emptySet()
+                  } catch (e: Exception) { emptySet() }
+                  val ops = ctx.getSystemService(Context.APP_OPS_SERVICE) as AppOpsManager
+
+                  val bg = Usage.background(ctx)
+                  val pkgs = pm.getInstalledPackages(PackageManager.GET_PERMISSIONS)
+                  for (pi in pkgs) {
+                      val ai = pi.applicationInfo ?: continue
+                      if (ai.flags and ApplicationInfo.FLAG_SYSTEM != 0) continue
+                      if (pi.packageName == ctx.packageName) continue
+                      val pkg = pi.packageName
+                      val name = pm.getApplicationLabel(ai).toString()
+
+                      fun add(sev: Int, t: String, w: String, f: Fix) = out.add(Finding(pkg, name, sev, t, w, f, isDomestic(pkg)))
+
+                      val req = pi.requestedPermissions ?: emptyArray()
+                      val flags = pi.requestedPermissionsFlags ?: IntArray(0)
+                      val granted = req.indices.filter {
+                          flags.getOrElse(it) { 0 } and android.content.pm.PackageInfo.REQUESTED_PERMISSION_GRANTED != 0
+                      }.map { req[it] }.toSet()
+
+                      for (p in perms) if (p.perm in granted) add(p.sev, p.title, p.why, Fix.APP_SETTINGS)
+
+                      if (acc.split(':').any { it.startsWith("$pkg/") })
+                          add(3, "سرویس دسترس‌پذیری (Accessibility) فعال",
+                              "خطرناک‌ترین دسترسی: این اپ می‌تواند هر چه روی صفحه نمایش داده می‌شود یا تایپ می‌کنید ببیند و حتی به‌جای شما کلیک کند. بدافزارها زیاد از آن استفاده می‌کنند.",
+                              Fix.ACCESSIBILITY)
+                      if (nl.split(':').any { it.startsWith("$pkg/") })
+                          add(3, "دسترسی به همه‌ی اعلان‌ها",
+                              "می‌تواند محتوای تمام نوتیفیکیشن‌های شما از جمله پیام‌ها و کدهای تأیید را بخواند.",
+                              Fix.NOTIF_LISTENER)
+                      if (pkg in admins)
+                          add(3, "مدیر دستگاه (Device Admin) فعال",
+                              "می‌تواند قفل صفحه را کنترل کند، گوشی را پاک کند و حذف خودش را سخت کند.",
+                              Fix.DEVICE_ADMIN)
+                      if ("android.permission.SYSTEM_ALERT_WINDOW" in req &&
+                          ops.unsafeCheckOpNoThrow("android:system_alert_window", ai.uid, pkg) == AppOpsManager.MODE_ALLOWED)
+                          add(2, "نمایش روی سایر اپ‌ها",
+                              "می‌تواند روی اپ‌های دیگر (مثلاً بانک) صفحه‌ی جعلی نشان دهد.",
+                              Fix.OVERLAY)
+                      val mb = (bg[ai.uid] ?: 0L) / 1048576
+                      if (mb >= 5) add(if (mb >= 100) 3 else if (mb >= 20) 2 else 1, "مصرف اینترنت در پس‌زمینه",
+                          "این اپ در ۳ روز اخیر حدود $mb مگابایت داده در پس‌زمینه (وقتی بازش نکرده بودید) مصرف کرده است. ممکن است داده‌هایتان را ارسال کند. در تنظیمات می‌توانید «داده‌ی پس‌زمینه» را برایش خاموش کنید.",
+                          Fix.APP_SETTINGS)
+                  }
+                  return out.sortedWith(compareByDescending<Finding> { it.severity }.thenBy { it.app })
+              }
+          }
+          APPGUARD_EOF
+          mkdir -p $(dirname app/src/main/java/com/example/appguard/MainActivity.kt)
+          cat > app/src/main/java/com/example/appguard/MainActivity.kt <<'APPGUARD_EOF'
+          package com.example.appguard
+
+          import android.app.Activity
+          import android.app.AlertDialog
+          import android.content.Intent
+          import android.graphics.Color
+          import android.net.Uri
+          import android.net.VpnService
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.provider.Settings
+          import android.view.Gravity
+          import android.view.View
+          import android.widget.*
+
+          class MainActivity : Activity() {
+              private lateinit var list: LinearLayout
+              private lateinit var status: TextView
+              private lateinit var vpnBtn: Button
+              private lateinit var domBtn: Button
+              private lateinit var usageBtn: Button
+              private var onlyDomestic = false
+              private var items = listOf<Finding>()
+              private val prefs by lazy { getSharedPreferences("ignored", MODE_PRIVATE) }
+
+              private fun btn(t: String, f: () -> Unit) = Button(this).apply { text = t; textSize = 12f; setOnClickListener { f() } }
+              private fun row(vararg v: View) = LinearLayout(this).apply {
+                  layoutDirection = View.LAYOUT_DIRECTION_RTL
+                  v.forEach { addView(it, LinearLayout.LayoutParams(0, -2, 1f)) }
+              }
+
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL; setPadding(32, 32, 32, 32)
+                      layoutDirection = View.LAYOUT_DIRECTION_RTL
+                  }
+                  domBtn = btn("فقط اپ‌های ایرانی: خاموش") { onlyDomestic = !onlyDomestic; updateBtns(); render() }
+                  vpnBtn = btn("") { toggleVpn() }
+                  usageBtn = btn("فعال‌سازی دسترسی آمار مصرف (لازم برای مصرف اینترنت)") {
+                      startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS))
+                  }
+                  status = TextView(this).apply { textSize = 15f; setPadding(0, 16, 0, 16) }
+                  list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                  root.addView(row(btn("اسکن دوباره") { scan() }, domBtn))
+                  root.addView(row(vpnBtn, btn("فعالیت شبکه") { startActivity(Intent(this, NetActivity::class.java)) }))
+                  root.addView(usageBtn)
+                  root.addView(status)
+                  root.addView(ScrollView(this).apply { addView(list) })
+                  setContentView(root)
+              }
+
+              override fun onResume() { super.onResume(); updateBtns(); scan() }
+
+              private fun updateBtns() {
+                  domBtn.text = "فقط اپ‌های ایرانی: " + if (onlyDomestic) "روشن" else "خاموش"
+                  vpnBtn.text = if (DnsVpnService.running) "توقف پایش شبکه" else "شروع پایش شبکه"
+                  usageBtn.visibility = if (Usage.hasAccess(this)) View.GONE else View.VISIBLE
+              }
+
+              private fun toggleVpn() {
+                  if (DnsVpnService.running) {
+                      startService(Intent(this, DnsVpnService::class.java).setAction("stop"))
+                      Handler(Looper.getMainLooper()).postDelayed({ updateBtns() }, 500)
+                  } else {
+                      val i = VpnService.prepare(this)
+                      if (i != null) startActivityForResult(i, 1) else startVpn()
+                  }
+              }
+
+              private fun startVpn() {
+                  startService(Intent(this, DnsVpnService::class.java))
+                  Handler(Looper.getMainLooper()).postDelayed({ updateBtns() }, 700)
+              }
+
+              @Deprecated("deprecated")
+              override fun onActivityResult(rc: Int, res: Int, d: Intent?) {
+                  super.onActivityResult(rc, res, d)
+                  if (rc == 1 && res == RESULT_OK) startVpn()
+              }
+
+              private fun scan() {
+                  status.text = "در حال بررسی اپ‌ها..."
+                  Thread {
+                      val all = Scanner.scan(this)
+                      val ignored = prefs.getStringSet("set", emptySet()) ?: emptySet()
+                      items = all.filter { "${it.pkg}|${it.title}" !in ignored }
+                      runOnUiThread { render() }
+                  }.start()
+              }
+
+              private fun render() {
+                  list.removeAllViews()
+                  val shown = items.filter { !onlyDomestic || it.domestic }
+                  status.text = if (shown.isEmpty()) "مورد مشکوکی پیدا نشد." else "${shown.size} مورد پیدا شد. برای جزئیات روی هر مورد بزنید."
+                  for (f in shown) {
+                      val color = when (f.severity) { 3 -> "#C62828"; 2 -> "#EF6C00"; else -> "#F9A825" }
+                      val card = TextView(this).apply {
+                          text = (if (f.domestic) "[ایرانی] " else "") + "${f.app}\n${f.title}"
+                          textSize = 16f; setPadding(32, 24, 32, 24)
+                          setTextColor(Color.BLACK); setBackgroundColor(Color.parseColor("#F2F2F2"))
+                          gravity = Gravity.START
+                          setOnClickListener { ask(f) }
+                      }
+                      val r = LinearLayout(this).apply {
+                          layoutDirection = View.LAYOUT_DIRECTION_RTL
+                          addView(View(context).apply { setBackgroundColor(Color.parseColor(color)) },
+                              LinearLayout.LayoutParams(16, LinearLayout.LayoutParams.MATCH_PARENT))
+                          addView(card, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+                      }
+                      list.addView(r, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = 16 })
+                  }
+              }
+
+              private fun ask(f: Finding) {
+                  val level = when (f.severity) { 3 -> "ریسک بالا"; 2 -> "ریسک متوسط"; else -> "ریسک کم" }
+                  AlertDialog.Builder(this).setTitle("${f.app} — ${f.title}")
+                      .setMessage("$level\n\n${f.why}\n\nمی‌خواهید این دسترسی را محدود کنید؟")
+                      .setPositiveButton("محدود کن") { _, _ -> openFix(f) }
+                      .setNeutralButton("نادیده بگیر") { _, _ ->
+                          val s = (prefs.getStringSet("set", emptySet()) ?: emptySet()).toMutableSet()
+                          s.add("${f.pkg}|${f.title}"); prefs.edit().putStringSet("set", s).apply(); scan()
+                      }
+                      .setNegativeButton("بعداً", null).show()
+              }
+
+              private fun openFix(f: Finding) {
+                  val uri = Uri.parse("package:${f.pkg}")
+                  val i = when (f.fix) {
+                      Fix.APP_SETTINGS -> Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, uri)
+                      Fix.ACCESSIBILITY -> Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
+                      Fix.NOTIF_LISTENER -> Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)
+                      Fix.DEVICE_ADMIN -> Intent(Settings.ACTION_SECURITY_SETTINGS)
+                      Fix.OVERLAY -> Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, uri)
+                  }
+                  try { startActivity(i) } catch (e: Exception) {
+                      Toast.makeText(this, "تنظیمات باز نشد", Toast.LENGTH_SHORT).show()
+                  }
+              }
+          }
+          APPGUARD_EOF
+          mkdir -p $(dirname app/src/main/java/com/example/appguard/DnsVpnService.kt)
+          cat > app/src/main/java/com/example/appguard/DnsVpnService.kt <<'APPGUARD_EOF'
+          package com.example.appguard
+
+          import android.content.Intent
+          import android.net.ConnectivityManager
+          import android.net.NetworkCapabilities
+          import android.net.VpnService
+          import android.os.ParcelFileDescriptor
+          import android.system.OsConstants
+          import java.io.FileInputStream
+          import java.io.FileOutputStream
+          import java.net.DatagramPacket
+          import java.net.DatagramSocket
+          import java.net.Inet4Address
+          import java.net.InetAddress
+          import java.net.InetSocketAddress
+          import java.util.concurrent.ConcurrentHashMap
+          import java.util.concurrent.Executors
+
+          /** VPN محلی فقط برای DNS: می‌بیند هر اپ چه دامنه‌هایی را می‌پرسد و می‌تواند اپ را مسدود کند. بقیه‌ی ترافیک دست‌نخورده می‌ماند. */
+          class DnsVpnService : VpnService() {
+              companion object {
+                  @Volatile var running = false
+                  const val FAKE_DNS = "10.0.0.2"
+                  val log = ConcurrentHashMap<String, ConcurrentHashMap<String, Int>>()
+              }
+              private var tun: ParcelFileDescriptor? = null
+              private val pool = Executors.newFixedThreadPool(8)
+              private val cm by lazy { getSystemService(ConnectivityManager::class.java) }
+
+              override fun onStartCommand(i: Intent?, f: Int, id: Int): Int {
+                  if (i?.action == "stop") { stopVpn(); return START_NOT_STICKY }
+                  if (running) return START_STICKY
+                  val upstream = upstreamDns()
+                  val t = Builder().setSession("AppGuard").addAddress("10.0.0.1", 32)
+                      .addDnsServer(FAKE_DNS).addRoute(FAKE_DNS, 32).establish() ?: return START_NOT_STICKY
+                  tun = t; running = true
+                  val inp = FileInputStream(t.fileDescriptor); val out = FileOutputStream(t.fileDescriptor)
+                  Thread {
+                      val buf = ByteArray(32767)
+                      while (running) {
+                          val n = try { inp.read(buf) } catch (e: Exception) { break }
+                          if (n > 0) try { handle(buf.copyOf(n), out, upstream) } catch (e: Exception) {}
+                      }
+                  }.start()
+                  return START_STICKY
+              }
+
+              override fun onRevoke() { stopVpn() }
+
+              private fun stopVpn() {
+                  running = false
+                  try { tun?.close() } catch (e: Exception) {}
+                  tun = null; stopSelf()
+              }
+
+              private fun upstreamDns(): InetAddress {
+                  for (n in cm.allNetworks) {
+                      val c = cm.getNetworkCapabilities(n) ?: continue
+                      if (c.hasTransport(NetworkCapabilities.TRANSPORT_VPN) ||
+                          !c.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) continue
+                      val d = cm.getLinkProperties(n)?.dnsServers?.firstOrNull { it is Inet4Address }
+                      if (d != null) return d
+                  }
+                  return InetAddress.getByName("8.8.8.8")
+              }
+
+              private fun u16(b: ByteArray, o: Int) = ((b[o].toInt() and 0xff) shl 8) or (b[o + 1].toInt() and 0xff)
+
+              private fun qname(q: ByteArray): String {
+                  var i = 12; val sb = StringBuilder()
+                  while (i < q.size && q[i].toInt() != 0) {
+                      val len = q[i].toInt() and 0xff
+                      if (i + 1 + len > q.size) break
+                      sb.append(String(q, i + 1, len)).append('.'); i += len + 1
+                  }
+                  return sb.toString().trimEnd('.')
+              }
+
+              private fun handle(p: ByteArray, out: FileOutputStream, up: InetAddress) {
+                  if (p.size < 28 || (p[0].toInt() shr 4) != 4 || p[9].toInt() != 17) return
+                  val ihl = (p[0].toInt() and 0x0f) * 4
+                  if (p.size < ihl + 20 || u16(p, ihl + 2) != 53) return
+                  val src = p.copyOfRange(12, 16); val dst = p.copyOfRange(16, 20); val sport = u16(p, ihl)
+                  val q = p.copyOfRange(ihl + 8, p.size)
+                  val domain = qname(q)
+                  val uid = try {
+                      cm.getConnectionOwnerUid(OsConstants.IPPROTO_UDP,
+                          InetSocketAddress(InetAddress.getByAddress(src), sport),
+                          InetSocketAddress(InetAddress.getByAddress(dst), 53))
+                  } catch (e: Exception) { -1 }
+                  val pkg = if (uid >= 0) (packageManager.getPackagesForUid(uid)?.firstOrNull() ?: "uid:$uid") else "unknown"
+                  log.getOrPut(pkg) { ConcurrentHashMap() }.merge(domain, 1) { a, b -> a + b }
+                  val blocked = getSharedPreferences("blocked", MODE_PRIVATE).getStringSet("set", emptySet())?.contains(pkg) == true
+                  if (blocked) { q[2] = 0x81.toByte(); q[3] = 0x83.toByte(); send(out, q, dst, src, sport); return }
+                  pool.execute {
+                      try {
+                          DatagramSocket().use { s ->
+                              protect(s); s.soTimeout = 3000
+                              s.send(DatagramPacket(q, q.size, up, 53))
+                              val r = ByteArray(4096); val dp = DatagramPacket(r, r.size)
+                              s.receive(dp)
+                              send(out, r.copyOf(dp.length), dst, src, sport)
+                          }
+                      } catch (e: Exception) {}
+                  }
+              }
+
+              private fun send(out: FileOutputStream, payload: ByteArray, srcIp: ByteArray, dstIp: ByteArray, dport: Int) {
+                  val total = 28 + payload.size; val b = ByteArray(total)
+                  b[0] = 0x45; b[2] = (total shr 8).toByte(); b[3] = total.toByte(); b[6] = 0x40; b[8] = 64; b[9] = 17
+                  System.arraycopy(srcIp, 0, b, 12, 4); System.arraycopy(dstIp, 0, b, 16, 4)
+                  var s = 0
+                  for (i in 0 until 20 step 2) s += u16(b, i)
+                  while ((s shr 16) != 0) s = (s and 0xffff) + (s shr 16)
+                  val c = s.inv() and 0xffff
+                  b[10] = (c shr 8).toByte(); b[11] = c.toByte()
+                  b[21] = 53; b[22] = (dport shr 8).toByte(); b[23] = dport.toByte()
+                  val ul = 8 + payload.size; b[24] = (ul shr 8).toByte(); b[25] = ul.toByte()
+                  System.arraycopy(payload, 0, b, 28, payload.size)
+                  synchronized(out) { out.write(b) }
+              }
+          }
+          APPGUARD_EOF
+          mkdir -p $(dirname app/src/main/java/com/example/appguard/NetActivity.kt)
+          cat > app/src/main/java/com/example/appguard/NetActivity.kt <<'APPGUARD_EOF'
+          package com.example.appguard
+
+          import android.app.Activity
+          import android.app.AlertDialog
+          import android.os.Bundle
+          import android.view.View
+          import android.widget.*
+
+          class NetActivity : Activity() {
+              private lateinit var list: LinearLayout
+              private lateinit var status: TextView
+              private val prefs by lazy { getSharedPreferences("blocked", MODE_PRIVATE) }
+              private val bad = listOf("analytics", "track", "adservice", "doubleclick", "crashlytics", "appsflyer",
+                  "adjust", "mixpanel", "metrica", "telemetry", "ads.", "stat.")
+
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL; setPadding(32, 32, 32, 32)
+                      layoutDirection = View.LAYOUT_DIRECTION_RTL
+                  }
+                  status = TextView(this).apply { textSize = 15f; setPadding(0, 16, 0, 16) }
+                  list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                  root.addView(Button(this).apply { text = "تازه‌سازی"; setOnClickListener { render() } })
+                  root.addView(status)
+                  root.addView(ScrollView(this).apply { addView(list) })
+                  setContentView(root)
+              }
+
+              override fun onResume() { super.onResume(); render() }
+
+              private fun name(p: String) = try {
+                  packageManager.getApplicationLabel(packageManager.getApplicationInfo(p, 0)).toString()
+              } catch (e: Exception) { p }
+
+              private fun blocked() = (prefs.getStringSet("set", emptySet()) ?: emptySet())
+
+              private fun render() {
+                  list.removeAllViews()
+                  status.text = if (!DnsVpnService.running) "پایش شبکه خاموش است. از صفحه‌ی اصلی روشنش کنید."
+                      else "اپ‌ها و دامنه‌هایی که با آن‌ها ارتباط می‌گیرند. روی هر اپ بزنید."
+                  val data = DnsVpnService.log.entries.sortedByDescending { it.value.size }
+                  for ((pkg, m) in data) {
+                      val bl = if (pkg in blocked()) " [مسدود]" else ""
+                      list.addView(TextView(this).apply {
+                          text = "${name(pkg)}$bl\n${m.size} دامنه، ${m.values.sum()} درخواست"
+                          textSize = 16f; setPadding(32, 24, 32, 24); setBackgroundColor(0xFFF2F2F2.toInt())
+                          setOnClickListener { detail(pkg) }
+                      }, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = 16 })
+                  }
+              }
+
+              private fun detail(pkg: String) {
+                  val m = DnsVpnService.log[pkg] ?: return
+                  val top = m.entries.sortedByDescending { it.value }.take(40)
+                  val sus = top.count { e -> bad.any { e.key.contains(it) } }
+                  val txt = top.joinToString("\n") { e ->
+                      (if (bad.any { e.key.contains(it) }) "⚠ " else "• ") + e.key + " (${e.value})"
+                  }
+                  val isB = pkg in blocked()
+                  AlertDialog.Builder(this).setTitle(name(pkg))
+                      .setMessage("دامنه‌هایی که این اپ می‌پرسد:\n\n$txt\n\n" +
+                          (if (sus > 0) "⚠ یعنی نام دامنه شبیه سرویس ردیابی/تبلیغات/آمارگیری است ($sus مورد).\n\n" else "") +
+                          "با «مسدود کردن»، این اپ دیگر نمی‌تواند نام سرورها را پیدا کند و عملاً اینترنتش قطع می‌شود (اپ‌هایی که مستقیم با IP کار می‌کنند یا DNS اختصاصی دارند ممکن است دور بزنند).")
+                      .setPositiveButton(if (isB) "رفع مسدودی" else "مسدود کن") { _, _ ->
+                          val s = blocked().toMutableSet(); if (isB) s.remove(pkg) else s.add(pkg)
+                          prefs.edit().putStringSet("set", s).apply(); render()
+                      }
+                      .setNegativeButton("بستن", null).show()
+              }
+          }
+          APPGUARD_EOF
+      - name: Build
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AppGuard-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp app/build/outputs/apk/debug/app-debug.apk AppGuard.apk
+          gh release create v${{ github.run_number }} AppGuard.apk --repo ${{ github.repository }} --title "AppGuard v${{ github.run_number }}" --notes "APK"
